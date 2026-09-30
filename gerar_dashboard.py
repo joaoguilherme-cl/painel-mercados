@@ -25,6 +25,7 @@ import pandas as pd
 
 BRT = timezone(timedelta(hours=-3))  # Brasil sem horário de verão desde 2019
 SAIDA = Path(__file__).resolve().parent / "docs"
+JANELA_CORR = 60  # pregões usados em cada ponto da correlação móvel
 
 ATIVOS = [
     {
@@ -140,6 +141,20 @@ def correlacoes(series: dict[str, pd.Series]) -> pd.DataFrame | None:
     return df.pct_change().dropna().corr()
 
 
+def correlacao_movel(series: dict[str, pd.Series]) -> dict:
+    """Correlação dos retornos diários em janela móvel, para cada par de ativos."""
+    if len(series) < 2:
+        return {}
+    ret = pd.concat(series, axis=1, join="inner").pct_change().dropna()
+    corte = ret.index[-1] - pd.Timedelta(days=365)
+    ids, pares = list(ret.columns), {}
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            s = ret[a].rolling(JANELA_CORR).corr(ret[b]).dropna()
+            pares[(a, b)] = pares[(b, a)] = s[s.index > corte]
+    return pares
+
+
 # ------------------------------------------------------------ formatação
 
 def num(v: float, casas: int = 2) -> str:
@@ -176,7 +191,8 @@ def grafico_svg(df: pd.DataFrame, cor: str, casas: int) -> str:
     mm50 = mm50_full[mm50_full.index > corte]
 
     W, H, E, D, T, B = 760, 240, 8, 64, 10, 26
-    lo, hi = float(c.min()), float(c.max())
+    lo = float(min(c.min(), mm50.min(skipna=True)))
+    hi = float(max(c.max(), mm50.max(skipna=True)))
     folga = (hi - lo) * 0.08 or abs(hi) * 0.01 or 1
     lo, hi = lo - folga, hi + folga
     n = len(c)
@@ -223,6 +239,35 @@ def grafico_svg(df: pd.DataFrame, cor: str, casas: int) -> str:
   <circle cx="{ux:.1f}" cy="{uy:.1f}" r="4" fill="{cor}" stroke="#fff" stroke-width="2"/>
   {''.join(meses)}
 </svg>"""
+
+
+def grafico_correlacao_svg(linhas: list[tuple[str, str, pd.Series]]) -> str:
+    """linhas: (nome, cor, série de correlação móvel)."""
+    W, H, E, D, T, B = 760, 132, 8, 64, 8, 22
+    ini = min(s.index[0] for _, _, s in linhas)
+    fim = max(s.index[-1] for _, _, s in linhas)
+    total = (fim - ini).total_seconds() or 1
+
+    def x(d): return E + (d - ini).total_seconds() / total * (W - E - D)
+    def y(v): return T + (1 - v) * (H - T - B) / 2
+
+    partes = []
+    for v in (1, 0.5, 0, -0.5, -1):
+        rot = ("+" if v > 0 else "−" if v < 0 else "") + num(abs(v), 1)
+        partes.append(
+            f'<line x1="{E}" x2="{W - D}" y1="{y(v):.1f}" y2="{y(v):.1f}" class="{"zero" if v == 0 else "grade"}"/>'
+            f'<text x="{W - D + 8}" y="{y(v) + 4:.1f}" class="eixo">{rot}</text>')
+    nomes = "jan fev mar abr mai jun jul ago set out nov dez".split()
+    for d in pd.date_range(ini, fim, freq="MS")[1:]:
+        if d.month % 2 == 1:
+            rot = nomes[d.month - 1] + (f" {str(d.year)[2:]}" if d.month == 1 else "")
+            partes.append(f'<text x="{x(d):.1f}" y="{H - 6}" class="eixo" text-anchor="middle">{rot}</text>')
+    for _, cor, s in linhas:
+        caminho = "M" + " L".join(f"{x(d):.1f},{y(v):.1f}" for d, v in s.items())
+        partes.append(f'<path d="{caminho}" fill="none" stroke="{cor}" stroke-width="1.6" stroke-linejoin="round"/>')
+        partes.append(f'<circle cx="{x(s.index[-1]):.1f}" cy="{y(s.iloc[-1]):.1f}" r="3.5" fill="{cor}" stroke="#fff" stroke-width="1.5"/>')
+    return (f'<svg viewBox="0 0 {W} {H}" role="img" '
+            f'aria-label="Correlação móvel com os outros ativos nos últimos 12 meses">{"".join(partes)}</svg>')
 
 
 # --------------------------------------------------------------- HTML
@@ -278,6 +323,13 @@ h1{font-family:"Fraunces",Georgia,serif;font-weight:600;font-size:clamp(28px,5vw
 .grafico .eixo{fill:var(--suave);font-size:11px;font-family:inherit}
 .grafico .mm{fill:none;stroke:var(--suave);stroke-width:1.2;stroke-dasharray:4 4}
 .legenda{font-size:12px;color:var(--suave);margin:4px 0 0}
+.corr{margin-top:20px;padding-top:14px;border-top:1px dashed var(--linha)}
+.corr h3{font-size:13px;font-weight:600;margin:0 0 2px}
+.corr .chaves{display:flex;flex-wrap:wrap;gap:4px 18px;font-size:13px;margin:0 0 4px}
+.corr .chave::before{content:"";display:inline-block;width:14px;height:3px;border-radius:2px;
+  background:var(--c);vertical-align:middle;margin-right:6px}
+.corr .chave b{font-weight:600}
+.grafico .zero{stroke:var(--suave);stroke-width:1;opacity:.6}
 
 .numeros{grid-column:1/-1;display:grid;grid-template-columns:1fr 1.3fr 1.1fr 1.1fr;gap:0 28px;
   border-top:1px solid var(--linha);padding-top:16px;margin-top:10px}
@@ -315,8 +367,22 @@ td.c{font-weight:600}
 """
 
 
+def bloco_correlacao(linhas: list) -> str:
+    if not linhas:
+        return ""
+    chaves = "".join(
+        f'<span class="chave" style="--c:{cor}">Com {nome}: <b>{num(serie.iloc[-1], 2).replace("-", "−")}</b></span>'
+        for nome, cor, serie in linhas)
+    return f"""<div class="corr">
+      <h3>Correlação móvel com os outros ativos</h3>
+      <div class="chaves">{chaves}</div>
+      {grafico_correlacao_svg(linhas)}
+      <p class="legenda">Cada ponto é a correlação dos retornos diários nos {JANELA_CORR} pregões anteriores àquela data. O valor em destaque é o mais recente.</p>
+    </div>"""
+
+
 def bloco_ativo(a: dict, df: pd.DataFrame | None, s: dict | None,
-                usdbrl: float | None, erro: str | None) -> str:
+                usdbrl: float | None, erro: str | None, corr_linhas: list | None = None) -> str:
     cab = (f'<h2>{html.escape(a["nome"])}</h2>'
            f'<p class="unid">{a["unidade"]}. {a["instrumento"]}.</p>')
     if s is None:
@@ -359,6 +425,7 @@ def bloco_ativo(a: dict, df: pd.DataFrame | None, s: dict | None,
   <div class="grafico">
     {grafico_svg(df, a['cor'], k)}
     <p class="legenda">Fechamentos dos últimos 12 meses. A linha tracejada é a média móvel de 50 dias. Última cotação em {data_br(s['data'])}.</p>
+    {bloco_correlacao(corr_linhas or [])}
   </div>
   <div class="numeros">
     <div><h3>Variação</h3><dl>{variacoes}</dl></div>
@@ -393,10 +460,17 @@ def tabela_correlacao(corr: pd.DataFrame | None, nomes: dict) -> str:
     return f"<table><thead><tr><th></th>{cab}</tr></thead><tbody>{linhas}</tbody></table>"
 
 
-def gerar_html(resultados: list, corr, agora: datetime) -> str:
+def gerar_html(resultados: list, corr, agora: datetime, moveis: dict | None = None) -> str:
     usdbrl = next((r[2]["ultimo"] for r in resultados if r[0]["id"] == "usdbrl" and r[2]), None)
-    blocos = "\n".join(bloco_ativo(a, df, s, usdbrl, e) for a, df, s, e in resultados)
     nomes = {a["id"]: a["nome"] for a in ATIVOS}
+    cores = {a["id"]: a["cor"] for a in ATIVOS}
+    moveis = moveis or {}
+
+    def linhas(aid):
+        return [(nomes[o], cores[o], moveis[(aid, o)]) for o in nomes
+                if o != aid and (aid, o) in moveis and not moveis[(aid, o)].empty]
+
+    blocos = "\n".join(bloco_ativo(a, df, s, usdbrl, e, linhas(a["id"])) for a, df, s, e in resultados)
     fontes = "".join(
         f'<li>{a["nome"]}: Yahoo Finance, ticker {a["ticker"]}. '
         f'<a href="{a["investing"]}" target="_blank" rel="noopener">Ver no Investing.com</a></li>'
@@ -429,7 +503,7 @@ def gerar_html(resultados: list, corr, agora: datetime) -> str:
   </div>
   <div class="bloco fontes">
     <h2>Como ler este painel</h2>
-    <p>Às 7h os futuros de ouro e Brent já estão negociando, então o preço e a variação do dia refletem o pregão em andamento, comparados ao fechamento anterior. Médias 20d, 50d e 200d são médias móveis simples, com a distância do preço atual entre parênteses. Volatilidade é o desvio-padrão dos retornos diários, anualizado. IFR acima de 70 costuma ser lido como sobrecompra e abaixo de 30 como sobrevenda.</p>
+    <p>Às 7h os futuros de ouro e Brent já estão negociando, então o preço e a variação do dia refletem o pregão em andamento, comparados ao fechamento anterior. Médias 20d, 50d e 200d são médias móveis simples, com a distância do preço atual entre parênteses. Volatilidade é o desvio-padrão dos retornos diários, anualizado. A correlação móvel mostra como essa relação mudou ao longo do ano. IFR acima de 70 costuma ser lido como sobrecompra e abaixo de 30 como sobrevenda.</p>
     <ul>{fontes}</ul>
   </div>
 </section>
@@ -459,10 +533,14 @@ def executar(baixador=baixar) -> int:
         return 1
 
     corr = correlacoes(closes)
+    moveis = correlacao_movel(closes)
     SAIDA.mkdir(parents=True, exist_ok=True)
-    (SAIDA / "index.html").write_text(gerar_html(resultados, corr, agora), encoding="utf-8")
+    (SAIDA / "index.html").write_text(gerar_html(resultados, corr, agora, moveis), encoding="utf-8")
     dados_json["gerado_em"] = agora.isoformat(timespec="minutes")
     dados_json["correlacao_12m"] = None if corr is None else corr.round(4).to_dict()
+    dados_json[f"correlacao_movel_{JANELA_CORR}p_atual"] = {
+        f"{a}-{b}": round(float(s.iloc[-1]), 4)
+        for (a, b), s in moveis.items() if a < b and not s.empty}
     (SAIDA / "dados.json").write_text(
         json.dumps(dados_json, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     print(f"Painel gerado em {SAIDA / 'index.html'}")
